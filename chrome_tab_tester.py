@@ -7,9 +7,9 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.1.0
+Version: 1.2.0
 Created: 2026-03-20
-Updated: 2026-06-04
+Updated: 2026-06-05
 """
 
 import sys
@@ -19,6 +19,7 @@ import random
 import os
 import re
 import time
+import math
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
@@ -41,10 +42,9 @@ DEFAULT_PRESETS = [
 ]
 
 CUSTOM_URLS_FILE = "custom_urls.txt"
-DEFAULT_COOLDOWN = 0.5 # Between chunks
+DEFAULT_COOLDOWN = 0.4 # Between chunks
 DEFAULT_RAM_THRESHOLD = 500
 DEFAULT_CHUNK_SIZE = 1
-DEFAULT_LOAD_TIME = 5.0
 DEFAULT_AUTO_SPLIT = True
 DEFAULT_MAX_TABS = 1000
 DEFAULT_FIGHT_CACHE = False
@@ -70,7 +70,8 @@ def archive_log(file):
     if not os.path.exists(file):
         return
 
-    log_dir = Path("logs") / datetime.now().strftime("%Y-%m-%d")
+    base_dir = Path(__file__).parent
+    log_dir = base_dir / "logs" / datetime.now().strftime("%Y-%m-%d")
     log_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%H%M%S")
@@ -234,10 +235,11 @@ def get_valid_input(prompt, current_val, min_val, max_val, is_float=False):
 
 def validate_url(url):
     """Validate custom urls"""
-    url = url.strip()
-    if not ((url.startswith("http://") or url.startswith("https://")) and len(url) > 10):
+    try:
+        result = urlparse(url.strip())
+        return all([result.scheme in ['http', 'https'], result.netloc])
+    except ValueError:
         return False
-    return "." in url.split("//")[1]
 
 def color_state(state_bool):
     """Returns a colorized ON/OFF string"""
@@ -261,6 +263,7 @@ class ChromeManager:
 
         # Initialize instance variables
         self.wait_mode = "auto"
+        self.default_incognito = use_incognito
         self.open_incognito = use_incognito
         self.disable_gpu = False
         self.show_metrics = True
@@ -270,7 +273,6 @@ class ChromeManager:
         self.max_tabs_per_window = DEFAULT_MAX_TABS
         self.min_ram_threshold = DEFAULT_RAM_THRESHOLD
         self.chunk_size = DEFAULT_CHUNK_SIZE
-        self.max_load_time = DEFAULT_LOAD_TIME
         self.cooldown = DEFAULT_COOLDOWN
         self.fight_cache = DEFAULT_FIGHT_CACHE
         self.peak_chrome_ram = 0
@@ -326,6 +328,10 @@ class ChromeManager:
                          f'--renderer-process-limit={render_process_limit}',    # Limits the total number of chrome processes
                          ]
         self.cmd_base.extend(chrome_tweaks)
+
+        # Additional tweaks...
+        #--disable-backgrounding-occluded-windows
+        #--disable-background-timer-throttling
 
         # Append 'Disable GPU' flag if enabled
         if self.disable_gpu:
@@ -596,25 +602,43 @@ class ChromeManager:
     def wait_for_render(self, num_tabs):
         """Handles the pause before taking the final RAM measurement"""
         if self.wait_mode == "auto":
-            # Caps the absolute minimum at 0.5s, and the maximum at 5.0s.
-            dynamic_duration = max(0.5, min(num_tabs * 0.05, self.max_load_time))
+            dynamic_duration = max(0.5, 1.5 * math.sqrt(num_tabs))
             animated_loading(dynamic_duration)
         else:
-            input("\n    -> Press ENTER once Chrome has finished loading all tabs...")
+            print()
+            input("    -> Press ENTER once Chrome has finished loading all tabs...")
 
     def reset_to_defaults(self):
         """Restores configurable preferences"""
+
+        # Check if core browser flags have been altered
+        needs_restart = (self.disable_gpu is not False) or (self.open_incognito != self.default_incognito)
+
+        if needs_restart:
+            confirm = input(
+                f"\n    {WARN} Resetting defaults requires restarting Chrome to revert base flags. Proceed? (y/N): ")
+            if confirm.strip().lower() != 'y':
+                print("    [+] Reset cancelled.")
+                return
+
+            self.kill_chrome()
+            self.disable_gpu = False
+            self.open_incognito = self.default_incognito
+            self.build_cmd_base()
+
+        # Reset standard variables
         self.show_metrics = True
         self.play_alerts = True
         self.wait_mode = "auto"
         self.use_stable_load_cutoff = False
         self.chunk_size = DEFAULT_CHUNK_SIZE
         self.cooldown = DEFAULT_COOLDOWN
-        self.max_load_time = DEFAULT_LOAD_TIME
         self.min_ram_threshold = DEFAULT_RAM_THRESHOLD
         self.auto_split_windows = DEFAULT_AUTO_SPLIT
         self.max_tabs_per_window = DEFAULT_MAX_TABS
-        print("\n    [+] Configuration reset to factory defaults.")
+        self.fight_cache = DEFAULT_FIGHT_CACHE
+
+        print("\n    [+] Configuration reset to default values.")
 
 
 def main():
@@ -655,7 +679,7 @@ def main():
                     if num > 500:
                         confirm = input(f"{WARN} Are you sure you want to open {num} tabs? (y/N): ")
                         if confirm.strip().lower() != 'y':
-                            print("Action cancelled.")
+                            print("    [+] Action cancelled.")
                             continue
 
                     if num > 0:
@@ -673,7 +697,7 @@ def main():
                 if confirm.lower() == 'y':
                     manager.kill_chrome()
                 else:
-                    print("Action cancelled.")
+                    print("    [+] Action cancelled.")
 
             elif choice == '4':
                 # Scrape current metrics
@@ -706,7 +730,7 @@ def main():
                     cutoff_state = color_state(manager.use_stable_load_cutoff)
                     split_state = color_state(manager.auto_split_windows)
                     incognito_state = color_state(manager.open_incognito)
-                    gpu_state = color_state(manager.disable_gpu)
+                    gpu_state = color_state(not manager.disable_gpu)
                     cache_state = color_state(manager.fight_cache)
 
                     print("\n--- Configuration Menu ---")
@@ -719,17 +743,16 @@ def main():
                     print(f"7. Toggle Hardware Acceleration [Current: {gpu_state}]")
                     print(f"8. Toggle Fight Browser Caching [Current: {cache_state}]")
                     print("---")
-                    print(f"9.  Max Load Time Duration [{manager.max_load_time}s]")
-                    print(f"10.  Change Tab Limit per Window [{manager.max_tabs_per_window} tabs]")
-                    print(f"11. Change Cooldown between Chunks [{manager.cooldown}s]")
-                    print(f"12. Change Chunk Size [{manager.chunk_size} tabs]")
-                    print(f"13. Change RAM Safety Threshold [{manager.min_ram_threshold} MB]")
-                    print("14. Reload Custom URLs File")
-                    print("15. Reset to Defaults")
+                    print(f"9.  Change Tab Limit per Window [{manager.max_tabs_per_window} tabs]")
+                    print(f"10. Change Cooldown between Chunks [{manager.cooldown}s]")
+                    print(f"11. Change Chunk Size [{manager.chunk_size} tabs]")
+                    print(f"12. Change RAM Safety Threshold [{manager.min_ram_threshold} MB]")
+                    print("13. Reload Custom URLs File")
+                    print("14. Reset to Defaults")
                     print("-" * 40)
                     print("0. Go Back\n")
 
-                    sub_choice = input("Select a setting to toggle (1-15) or 0 to return: ").strip()
+                    sub_choice = input("Select a setting to toggle (1-14) or 0 to return: ").strip()
                     if sub_choice == '1':
                         manager.show_metrics = not manager.show_metrics
                         print(f"    [+] Terminal metrics toggled {color_state(manager.show_metrics)}.")
@@ -768,18 +791,16 @@ def main():
                         manager.fight_cache = not manager.fight_cache
                         print(f"    [+] Fight Browser Caching toggled {color_state(manager.fight_cache)}.")
                     elif sub_choice == '9':
-                        manager.max_load_time = get_valid_input("Max load time (0.5s - 30.0s)", manager.max_load_time, 0.5, 30.0, True)
-                    elif sub_choice == '10':
                         manager.max_tabs_per_window = get_valid_input("Max tabs before splitting (5 - 5000)", manager.max_tabs_per_window, 5, 5000)
-                    elif sub_choice == '11':
+                    elif sub_choice == '10':
                         manager.cooldown = get_valid_input("Cooldown between chunks (0.0s - 60.0s)", manager.cooldown, 0.0, 60.0, True)
-                    elif sub_choice == '12':
+                    elif sub_choice == '11':
                         manager.chunk_size = get_valid_input("New chunk size (1 - 1000 tabs)", manager.chunk_size, 1, 1000)
-                    elif sub_choice == '13':
+                    elif sub_choice == '12':
                         manager.min_ram_threshold = get_valid_input("Minimum RAM to trigger Safety Threshold (100 - 5000 MB)", manager.min_ram_threshold, 100, 5000)
-                    elif sub_choice == '14':
+                    elif sub_choice == '13':
                         manager.load_presets()
-                    elif sub_choice == '15':
+                    elif sub_choice == '14':
                         manager.reset_to_defaults()
                     elif sub_choice == '0':
                         break
