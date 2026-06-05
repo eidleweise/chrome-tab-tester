@@ -22,6 +22,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
+from urllib.parse import urlparse, urlunparse
 
 # ==========================================
 # CONFIGURATION & CONSTANTS
@@ -40,9 +41,9 @@ DEFAULT_PRESETS = [
 ]
 
 CUSTOM_URLS_FILE = "custom_urls.txt"
-DEFAULT_COOLDOWN = 0.3 # Between chunks
+DEFAULT_COOLDOWN = 0.5 # Between chunks
 DEFAULT_RAM_THRESHOLD = 500
-DEFAULT_CHUNK_SIZE = 50
+DEFAULT_CHUNK_SIZE = 1
 DEFAULT_LOAD_TIME = 5.0
 DEFAULT_AUTO_SPLIT = True
 DEFAULT_MAX_TABS = 1000
@@ -180,7 +181,7 @@ def get_chrome_ram():
             return total_kb // 1024
 
     except Exception as e:
-            print(f"{WARN} Error reading Chrome RAM: {e}")
+        print(f"{WARN} Error reading Chrome RAM: {e}")
 
     return 0
 
@@ -261,6 +262,7 @@ class ChromeManager:
         # Initialize instance variables
         self.wait_mode = "auto"
         self.open_incognito = use_incognito
+        self.disable_gpu = False
         self.show_metrics = True
         self.play_alerts = True
         self.use_stable_load_cutoff = False
@@ -314,7 +316,21 @@ class ChromeManager:
             print("Unsupported OS. This script is designed for Windows, Mac, and Linux.")
             sys.exit(1)
 
-        # Append Incognito flag if enabled
+        # Configuration Tweaks
+        logical_cores = os.cpu_count() or 4 # Fallback to 4
+        render_process_limit = max(1, int(logical_cores * 0.46)) # Sets the limit to 46% of logical threads (approx. 1 process per physical core)
+
+        chrome_tweaks = ['--test-type',                                         # Hide warnings
+                         '--disable-features=HighEfficiencyMode',               # Prevents Chrome's memory efficiency
+                         '--disable-site-isolation-trials',                     # Prevents 3rd Party Process bloat
+                         f'--renderer-process-limit={render_process_limit}',    # Limits the total number of chrome processes
+                         ]
+        self.cmd_base.extend(chrome_tweaks)
+
+        # Append 'Disable GPU' flag if enabled
+        if self.disable_gpu:
+            self.cmd_base.append('--disable-gpu')
+        # Append 'Incognito' flag if enabled
         if self.open_incognito:
             self.cmd_base.append('--incognito')
 
@@ -357,40 +373,54 @@ class ChromeManager:
 
     def create_window(self, num_tabs):
         """Creates a new Chrome window with specifiable number of tabs"""
+        self._dispatch_tabs(num_tabs, force_new_window=True)
+
+    def add_tabs_to_active_window(self, num_tabs):
+        """Adds X more tabs to the active window"""
+        if not self.windows:
+            print(f"\n{WARN} No windows tracked yet! Creating a new window instead.")
+            self.create_window(num_tabs)
+            return
+
+        self._dispatch_tabs(num_tabs, force_new_window=False)
+
+    def _dispatch_tabs(self, num_tabs, force_new_window=False):
+        """Central logic for chunking and opening tabs"""
         if self.fight_cache:
-            tab_queue = [f"{random.choice(self.active_urls)}?stress={random.randint(1, 999999)}" for _ in range(num_tabs)]
+            tab_queue = [ChromeManager._generate_stress_url(random.choice(self.active_urls)) for _ in range(num_tabs)]
         else:
             tab_queue = random.choices(self.active_urls, k=num_tabs)
 
-        print(f"\n[*] Preparing to blast {num_tabs} tabs. This may take a moment...")
-        original_chrome_ram = get_chrome_ram()
+        action_text = "blast" if force_new_window else "inject"
+        print(f"\n[*] Preparing to {action_text} {num_tabs} tabs. This may take a moment...")
 
+        original_chrome_ram = get_chrome_ram()
         tabs_opened = 0
-        is_first_chunk = True
+        is_first_chunk = force_new_window
 
         while tab_queue:
             if not self._is_safe_to_open():
-                print(f"{WARN} Stopping blast. {tabs_opened} tabs were opened.")
+                print(f"\n{WARN} Stopping {action_text}. {tabs_opened} tabs were opened.")
                 break
 
             # Calculate space left in the active window
             if is_first_chunk:
                 space_left = self.max_tabs_per_window if self.auto_split_windows else float('inf')
+            elif self.auto_split_windows and self.windows:
+                space_left = self.max_tabs_per_window - len(self.windows[-1]["urls"])
+                if space_left <= 0:
+                    space_left = self.max_tabs_per_window
             else:
-                if self.auto_split_windows:
-                    space_left = self.max_tabs_per_window - len(self.windows[-1]["urls"])
-                    if space_left <= 0:
-                        space_left = self.max_tabs_per_window
-                else:
-                    space_left = len(tab_queue)
+                space_left = len(tab_queue)
 
-            # Priortize the smallest: user's chunk size, space left in a window, or remaining tabs
+            # Prioritize the smallest: user's chunk size, space left in a window, or remaining tabs
             take_count = min(self.chunk_size, space_left, len(tab_queue))
             chunk = tab_queue[:take_count]
             tab_queue = tab_queue[take_count:]
 
             # Force a new window for the first chunk, or if the current window is full
-            needs_new_window = is_first_chunk or (self.auto_split_windows and len(self.windows[-1]["urls"]) >= self.max_tabs_per_window)
+            needs_new_window = is_first_chunk or (self.auto_split_windows and (
+                        not self.windows or len(self.windows[-1]["urls"]) >= self.max_tabs_per_window))
 
             if needs_new_window:
                 self._run_cmd(["--new-window"] + chunk)
@@ -402,69 +432,16 @@ class ChromeManager:
             is_first_chunk = False
             time.sleep(self.cooldown)
             tabs_opened += len(chunk)
+
             if self.show_metrics:
-                print(f"    -> Opened {len(chunk)} tab(s)...")
+                print(f"\r    -> Opened: [ {tabs_opened} / {num_tabs} ]...", end="", flush=True)
 
         if tabs_opened > 0:
             self.wait_for_render(tabs_opened)
-            self.print_metrics(original_chrome_ram, tabs_opened)
+            action_type = "New" if force_new_window else "add"
+            self.print_metrics(original_chrome_ram, tabs_opened, action_type)
         else:
             print(f"\n{WARN} Safety trigger prevented any tabs from opening. No metrics recorded.")
-
-    def add_tabs_to_active_window(self, num_tabs):
-        """Adds X more tabs to the active window"""
-        if not self.windows:
-            print(f"\n{WARN} No windows tracked yet! Creating a new window instead.")
-            self.create_window(num_tabs)
-            return
-
-        if self.fight_cache:
-            tab_queue = [f"{random.choice(self.active_urls)}?stress={random.randint(1, 999999)}" for _ in range(num_tabs)]
-        else:
-            tab_queue = random.choices(self.active_urls, k=num_tabs)
-        print(f"\n[*] Injecting {num_tabs} tabs into the active window...")
-        original_chrome_ram = get_chrome_ram()
-
-        tabs_opened = 0
-
-        while tab_queue:
-            if not self._is_safe_to_open():
-                print(f"{WARN} Stopping blast. {tabs_opened} tabs were opened.")
-                break
-
-            # Calculate space left in the active window
-            if self.auto_split_windows:
-                space_left = self.max_tabs_per_window - len(self.windows[-1]["urls"])
-                if space_left <= 0:
-                    space_left = self.max_tabs_per_window
-            else:
-                space_left = len(tab_queue)
-
-            # Priortize the smallest: user's chunk size, space left in a window, or remaining tabs
-            take_count = min(self.chunk_size, space_left, len(tab_queue))
-            chunk = tab_queue[:take_count]
-            tab_queue = tab_queue[take_count:]
-
-            # Force a new window if the current one is full
-            needs_new_window = self.auto_split_windows and len(self.windows[-1]["urls"]) >= self.max_tabs_per_window
-
-            if needs_new_window:
-                self._run_cmd(["--new-window"] + chunk)
-                self.windows.append({"urls": chunk})
-            else:
-                self._run_cmd(chunk)
-                self.windows[-1]["urls"].extend(chunk)
-
-            time.sleep(self.cooldown)
-            tabs_opened += len(chunk)
-            if self.show_metrics:
-                print(f"    -> Opened {len(chunk)} tabs...")
-
-        if tabs_opened > 0:
-            self.wait_for_render(tabs_opened)
-            self.print_metrics(original_chrome_ram, tabs_opened, "add")
-        else:
-            print(f"\n{WARN} Safety trigger prevented any tabs from opening.")
 
     def kill_chrome(self):
         """Emergency kill switch for all Chrome processes."""
@@ -601,11 +578,26 @@ class ChromeManager:
             return "N/A"
         return f"{value:,}" if value > 0 else "Error"
 
+    @staticmethod
+    def _generate_stress_url(url):
+        # Disassemble URL
+        parsed = urlparse(url)
+        query = parsed.query
+        stress_param = f"stress={random.randint(1, 999999)}"
+
+        # Append or create a new query
+        new_query = f"{query}&{stress_param}" if query else stress_param
+
+        # Reconstruct and return URL
+        new_parts = list(parsed)
+        new_parts[4] = new_query
+        return urlunparse(new_parts)
+
     def wait_for_render(self, num_tabs):
         """Handles the pause before taking the final RAM measurement"""
         if self.wait_mode == "auto":
             # Caps the absolute minimum at 0.5s, and the maximum at 5.0s.
-            dynamic_duration = max(0.5, min(num_tabs * 0.5, self.max_load_time))
+            dynamic_duration = max(0.5, min(num_tabs * 0.05, self.max_load_time))
             animated_loading(dynamic_duration)
         else:
             input("\n    -> Press ENTER once Chrome has finished loading all tabs...")
@@ -661,14 +653,12 @@ def main():
                 try:
                     num = int(input("How many tabs? "))
                     if num > 500:
-                        confirm = input(f"{WARN} Are you sure you want to open {num} tabs? (Y/n): ")
-                        if confirm.strip().lower() == 'n':
+                        confirm = input(f"{WARN} Are you sure you want to open {num} tabs? (y/N): ")
+                        if confirm.strip().lower() != 'y':
                             print("Action cancelled.")
                             continue
 
                     if num > 0:
-                        archive_log(manager.log_file)
-
                         if choice == '1':
                             manager.create_window(num)
                         else:
@@ -679,7 +669,7 @@ def main():
                     print("Invalid input. Please enter a number.")
 
             elif choice == '3':
-                confirm = input(f"{WARN} This will forcefully close ALL Chrome windows. Proceed? (Y/n): ")
+                confirm = input(f"{WARN} This will forcefully close ALL Chrome windows. Proceed? (y/N): ")
                 if confirm.lower() == 'y':
                     manager.kill_chrome()
                 else:
@@ -716,6 +706,7 @@ def main():
                     cutoff_state = color_state(manager.use_stable_load_cutoff)
                     split_state = color_state(manager.auto_split_windows)
                     incognito_state = color_state(manager.open_incognito)
+                    gpu_state = color_state(manager.disable_gpu)
                     cache_state = color_state(manager.fight_cache)
 
                     print("\n--- Configuration Menu ---")
@@ -725,19 +716,20 @@ def main():
                     print(f"4. Toggle Safety Cutoff [Current: {cutoff_state}]")
                     print(f"5. Toggle Auto-Split Windows [Current: {split_state}]")
                     print(f"6. Toggle Incognito Mode [Current: {incognito_state}]")
-                    print(f"7. Toggle Fight Browser Caching [Current: {cache_state}]")
+                    print(f"7. Toggle Hardware Acceleration [Current: {gpu_state}]")
+                    print(f"8. Toggle Fight Browser Caching [Current: {cache_state}]")
                     print("---")
-                    print(f"8.  Max Load Time Duration [{manager.max_load_time}s]")
-                    print(f"9.  Change Tab Limit per Window [{manager.max_tabs_per_window} tabs]")
-                    print(f"10. Change Cooldown between Chunks [{manager.cooldown}s]")
-                    print(f"11. Change Chunk Size [{manager.chunk_size} tabs]")
-                    print(f"12. Change RAM Safety Threshold [{manager.min_ram_threshold} MB]")
-                    print("13. Reload Custom URLs File")
-                    print("14. Reset to Defaults")
+                    print(f"9.  Max Load Time Duration [{manager.max_load_time}s]")
+                    print(f"10.  Change Tab Limit per Window [{manager.max_tabs_per_window} tabs]")
+                    print(f"11. Change Cooldown between Chunks [{manager.cooldown}s]")
+                    print(f"12. Change Chunk Size [{manager.chunk_size} tabs]")
+                    print(f"13. Change RAM Safety Threshold [{manager.min_ram_threshold} MB]")
+                    print("14. Reload Custom URLs File")
+                    print("15. Reset to Defaults")
                     print("-" * 40)
                     print("0. Go Back\n")
 
-                    sub_choice = input("Select a setting to toggle (1-14) or 0 to return: ").strip()
+                    sub_choice = input("Select a setting to toggle (1-15) or 0 to return: ").strip()
                     if sub_choice == '1':
                         manager.show_metrics = not manager.show_metrics
                         print(f"    [+] Terminal metrics toggled {color_state(manager.show_metrics)}.")
@@ -755,25 +747,39 @@ def main():
                         manager.auto_split_windows = not manager.auto_split_windows
                         print(f"    [+] Auto-Split windows toggled {color_state(manager.auto_split_windows)}.")
                     elif sub_choice == '6':
-                        manager.open_incognito = not manager.open_incognito
-                        manager.build_cmd_base()
-                        print(f"    [+] Incognito Mode toggled {color_state(manager.open_incognito)}.")
+                        confirm = input(f"    {WARN} Toggling this feature will shut down Chrome. Proceed? (y/N): ")
+                        if confirm.lower() == 'y':
+                            manager.kill_chrome()
+                            manager.open_incognito = not manager.open_incognito
+                            manager.build_cmd_base()
+                            print(f"    [+] Incognito Mode toggled {color_state(manager.open_incognito)}.")
+                        else:
+                            print(f"    [+] Incognito Mode will remain {color_state(manager.open_incognito)}")
                     elif sub_choice == '7':
+                        confirm = input(f"    {WARN} Toggling this feature will shut down Chrome. Proceed? (y/N): ")
+                        if confirm.lower() == 'y':
+                            manager.kill_chrome()
+                            manager.disable_gpu = not manager.disable_gpu
+                            manager.build_cmd_base()
+                            print(f"    [+] Hardware Acceleration toggled {color_state(manager.disable_gpu)}")
+                        else:
+                            print(f"    [+] Hardware Acceleration will remain {color_state(manager.disable_gpu)}")
+                    elif sub_choice == '8':
                         manager.fight_cache = not manager.fight_cache
                         print(f"    [+] Fight Browser Caching toggled {color_state(manager.fight_cache)}.")
-                    elif sub_choice == '8':
-                        manager.max_load_time = get_valid_input("Max load time (0.5s - 30.0s)", manager.max_load_time, 0.5, 30.0, True)
                     elif sub_choice == '9':
-                        manager.max_tabs_per_window = get_valid_input("Max tabs before splitting (5 - 5000)", manager.max_tabs_per_window, 5, 5000)
+                        manager.max_load_time = get_valid_input("Max load time (0.5s - 30.0s)", manager.max_load_time, 0.5, 30.0, True)
                     elif sub_choice == '10':
-                        manager.cooldown = get_valid_input("Cooldown between chunks (0.0s - 60.0s)", manager.cooldown, 0.0, 60.0, True)
+                        manager.max_tabs_per_window = get_valid_input("Max tabs before splitting (5 - 5000)", manager.max_tabs_per_window, 5, 5000)
                     elif sub_choice == '11':
-                        manager.chunk_size = get_valid_input("New chunk size (1 - 1000 tabs)", manager.chunk_size, 1, 1000)
+                        manager.cooldown = get_valid_input("Cooldown between chunks (0.0s - 60.0s)", manager.cooldown, 0.0, 60.0, True)
                     elif sub_choice == '12':
-                        manager.min_ram_threshold = get_valid_input("Minimum RAM to trigger Safety Threshold (100 - 5000 MB)", manager.min_ram_threshold, 100, 5000)
+                        manager.chunk_size = get_valid_input("New chunk size (1 - 1000 tabs)", manager.chunk_size, 1, 1000)
                     elif sub_choice == '13':
-                        manager.load_presets()
+                        manager.min_ram_threshold = get_valid_input("Minimum RAM to trigger Safety Threshold (100 - 5000 MB)", manager.min_ram_threshold, 100, 5000)
                     elif sub_choice == '14':
+                        manager.load_presets()
+                    elif sub_choice == '15':
                         manager.reset_to_defaults()
                     elif sub_choice == '0':
                         break
@@ -793,7 +799,7 @@ def main():
         archive_log(manager.log_file)
         archive_log(manager.csv_file)
 
-        kill_processes = input(f"{WARN} Would you like to kill ALL Chrome processes? (Y/n): ")
+        kill_processes = input(f"{WARN} Would you like to kill ALL Chrome processes? (y/N): ")
         if kill_processes.lower() == 'y':
             manager.kill_chrome()
         else:
