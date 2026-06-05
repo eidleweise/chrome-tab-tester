@@ -7,7 +7,7 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.2.0
+Version: 1.2.2
 Created: 2026-03-20
 Updated: 2026-06-05
 """
@@ -600,7 +600,10 @@ class ChromeManager:
     def wait_for_render(self, num_tabs):
         """Handles the pause before taking the final RAM measurement"""
         if self.wait_mode == "auto":
-            dynamic_duration = max(0.5, 1.5 * math.sqrt(num_tabs))
+            # Base wait time for the final chunk
+            tabs_to_wait_for = min(num_tabs, self.chunk_size)
+            # Apply a curve with a 0.5s minimum
+            dynamic_duration = max(0.5, 1.5 * math.sqrt(tabs_to_wait_for))
             animated_loading(dynamic_duration)
         else:
             print()
