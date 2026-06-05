@@ -325,13 +325,11 @@ class ChromeManager:
         chrome_tweaks = ['--test-type',                                         # Hide warnings
                          '--disable-features=HighEfficiencyMode',               # Prevents Chrome's memory efficiency
                          '--disable-site-isolation-trials',                     # Prevents 3rd Party Process bloat
+                         '--disable-backgrounding-occluded-windows',            # Prevents Chrome from unrendering hidden tabs
+                         '--disable-background-timer-throttling',               # Prevents Chrome from slowing down JS execution in hidden tabs
                          f'--renderer-process-limit={render_process_limit}',    # Limits the total number of chrome processes
                          ]
         self.cmd_base.extend(chrome_tweaks)
-
-        # Additional tweaks...
-        #--disable-backgrounding-occluded-windows
-        #--disable-background-timer-throttling
 
         # Append 'Disable GPU' flag if enabled
         if self.disable_gpu:
