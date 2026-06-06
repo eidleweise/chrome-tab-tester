@@ -7,7 +7,7 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.2.3
+Version: 1.2.4
 Created: 2026-03-20
 Updated: 2026-06-05
 """
@@ -28,6 +28,7 @@ from urllib.parse import urlparse, urlunparse
 # ==========================================
 # CONFIGURATION & CONSTANTS
 # ==========================================
+
 # Curated Websites
 DEFAULT_PRESETS = [
     "https://earth.google.com/web/",  # Heavy WebGL
@@ -41,14 +42,15 @@ DEFAULT_PRESETS = [
     "https://LTTstore.com/", # It's how you use a stubby that matters
 ]
 
-CUSTOM_URLS_FILE = "custom_urls.txt"
+BASE_DIR = Path(__file__).parent.resolve()
+CUSTOM_URLS_FILE = BASE_DIR / "custom_urls.txt"
 DEFAULT_COOLDOWN = 0.3 # Between chunks
 DEFAULT_RAM_THRESHOLD = 500
 DEFAULT_CHUNK_SIZE = 1
 DEFAULT_AUTO_SPLIT = True
 DEFAULT_MAX_TABS = 1000
 DEFAULT_FIGHT_CACHE = False
-DEFAULT_THREAD_ALLOCATION = 88
+DEFAULT_THREAD_ALLOCATION = 88 # Leaving some headroom for the OS
 
 # ANSI Color Codes
 LTT_ORANGE = "\033[38;2;243;111;33m"
@@ -68,18 +70,19 @@ class Platform(Enum):
 # ==========================================
 def archive_log(file):
     """Moves a specific file to the dated logs folder with a timestamp"""
-    if not os.path.exists(file):
+    path_obj = Path(file)
+
+    if not path_obj.exists():
         return
 
-    base_dir = Path(__file__).parent
-    log_dir = base_dir / "logs" / datetime.now().strftime("%Y-%m-%d")
+    log_dir = BASE_DIR / "logs" / datetime.now().strftime("%Y-%m-%d")
     log_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%H%M%S")
-    name, ext = os.path.splitext(file)
-    new_path = log_dir / f"{name}_{timestamp}{ext}"
+    new_name = f"{path_obj.stem}_{timestamp}{path_obj.suffix}"
+    new_path = log_dir / new_name
 
-    shutil.move(file, new_path)
+    shutil.move(path_obj, new_path)
 
 def animated_loading(duration):
     """Displays an animated terminal loading bar for a set duration"""
@@ -255,8 +258,8 @@ class ChromeManager:
         # Window tracker list
         self.windows = []
         self.blasts = []
-        self.log_file = "ram_metrics.txt"
-        self.csv_file = "chrome_benchmarks.csv"
+        self.log_file = BASE_DIR / "ram_metrics.txt"
+        self.csv_file = BASE_DIR / "chrome_benchmarks.csv"
 
         # Log cleanup
         archive_log(self.log_file)
@@ -303,7 +306,7 @@ class ChromeManager:
                 os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
                 os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe")
             ]
-            chrome_path = next((p for p in paths if os.path.exists(p)), None)
+            chrome_path = next((p for p in paths if Path(p).exists()), None)
 
             # Fallback to system path lookup
             if not chrome_path:
@@ -322,14 +325,12 @@ class ChromeManager:
             sys.exit(1)
 
         # Configuration Tweaks
-        render_process_limit = max(1, int(self.logical_cores * (self.thread_allocation / 100))) # Allocates a percentage of logical threads
-
         chrome_tweaks = ['--test-type',                                         # Hide warnings
                          '--disable-features=HighEfficiencyMode',               # Prevents Chrome's memory efficiency
                          '--disable-site-isolation-trials',                     # Prevents 3rd Party Process bloat
                          '--disable-backgrounding-occluded-windows',            # Prevents Chrome from unrendering hidden tabs
                          '--disable-background-timer-throttling',               # Prevents Chrome from slowing down JS execution in hidden tabs
-                         f'--renderer-process-limit={render_process_limit}',    # Limits the total number of chrome processes
+                         f'--renderer-process-limit={self.allocated_renderers}',    # Limits the total number of chrome processes
                          ]
         self.cmd_base.extend(chrome_tweaks)
 
@@ -342,7 +343,7 @@ class ChromeManager:
 
     def load_presets(self):
         """Parses targets.txt for custom URLs. Uses 'PRESETS' otherwise."""
-        if os.path.exists(CUSTOM_URLS_FILE):
+        if CUSTOM_URLS_FILE.exists():
             try:
                 with open(CUSTOM_URLS_FILE, 'r', encoding='utf-8') as f:
                     urls = []
@@ -504,7 +505,7 @@ class ChromeManager:
         except IOError as e:
             print(f"\n    {WARN} Error writing to log file: {e}")
 
-        file_exists = os.path.isfile(self.csv_file)
+        file_exists = self.csv_file.is_file()
         try:
             with open(self.csv_file, 'a') as f:
                 if not file_exists:
@@ -553,6 +554,11 @@ class ChromeManager:
             print(f"    -> System CPU Load: {cpu_val}%")
         else:
             print(f"    -> (Metrics hidden). Check the 'View Metrics' menu for details.")
+
+    @property
+    def allocated_renderers(self):
+        """Calculates the allowed renderer processes based on logical cores."""
+        return max(1, int(self.logical_cores * (self.thread_allocation / 100)))
 
     def _is_safe_to_open(self):
         """Stops opening tabs if available RAM falls below threshhold"""
@@ -722,7 +728,7 @@ def main():
                 print(f"Current Chrome RAM Usage: {cur_ram:,} MB")
                 print(f"Current CPU Load:  {cur_cpu}%")
 
-                if os.path.exists(manager.log_file):
+                if manager.log_file.exists():
                     print("\n--- LAST LOGGED REPORT ---")
                     with open(manager.log_file, 'r') as f:
                         print(f.read())
@@ -741,9 +747,6 @@ def main():
                     gpu_state = color_state(not manager.disable_gpu)
                     cache_state = color_state(manager.fight_cache)
 
-                    # Current Thread Allocation
-                    cur_allocated = max(1, int(manager.logical_cores * (manager.thread_allocation / 100)))
-
                     print("\n--- Configuration Menu ---")
                     print(f"1. Toggle Terminal Metrics [Current: {metrics_state}]")
                     print(f"2. Toggle Audio Alerts [Current: {alert_state}]")
@@ -758,7 +761,7 @@ def main():
                     print(f"10. Change Cooldown between Chunks [{manager.cooldown}s]")
                     print(f"11. Change Chunk Size [{manager.chunk_size} tabs]")
                     print(f"12. Change RAM Safety Threshold [{manager.min_ram_threshold} MB]")
-                    print(f"13. Change Thread Allocation Percentage [{manager.thread_allocation}% | {cur_allocated} Threads]")
+                    print(f"13. Change Thread Allocation Percentage [{manager.thread_allocation}% | {manager.allocated_renderers} Threads]")
                     print("14. Reload Custom URLs File")
                     print("15. Reset to Defaults")
                     print("-" * 40)
@@ -816,10 +819,9 @@ def main():
                             manager.kill_chrome()
                             manager.thread_allocation = get_valid_input("Thread Allocation percentage (1 - 100%)", manager.thread_allocation, 1, 100)
                             manager.build_cmd_base()
-                            allocated_threads = max(1, int(manager.logical_cores * (manager.thread_allocation / 100)))
-                            print(f"    [+] Chrome will allocate {manager.thread_allocation}% of Logical CPU Cores ({allocated_threads} threads)")
+                            print(f"    [+] Chrome will allocate {manager.thread_allocation}% of Logical CPU Cores ({manager.allocated_renderers} threads)")
                         else:
-                            print(f"    [+] Thread allocation will remain at {manager.thread_allocation}% ({cur_allocated} threads)")
+                            print(f"    [+] Thread allocation will remain at {manager.thread_allocation}% ({manager.allocated_renderers} threads)")
                     elif sub_choice == '14':
                         manager.load_presets()
                     elif sub_choice == '15':
