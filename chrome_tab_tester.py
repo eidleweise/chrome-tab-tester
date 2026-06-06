@@ -7,7 +7,7 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.2.2
+Version: 1.2.3
 Created: 2026-03-20
 Updated: 2026-06-05
 """
@@ -42,12 +42,13 @@ DEFAULT_PRESETS = [
 ]
 
 CUSTOM_URLS_FILE = "custom_urls.txt"
-DEFAULT_COOLDOWN = 0.4 # Between chunks
+DEFAULT_COOLDOWN = 0.3 # Between chunks
 DEFAULT_RAM_THRESHOLD = 500
 DEFAULT_CHUNK_SIZE = 1
 DEFAULT_AUTO_SPLIT = True
 DEFAULT_MAX_TABS = 1000
 DEFAULT_FIGHT_CACHE = False
+DEFAULT_THREAD_ALLOCATION = 88
 
 # ANSI Color Codes
 LTT_ORANGE = "\033[38;2;243;111;33m"
@@ -115,7 +116,7 @@ def get_total_ram():
             return int(result) // (1024 * 1024)
 
     except Exception as e:
-        print(f"{WARN} Error reading Total RAM: {e}")
+        print(f"    {WARN} Error reading Total RAM: {e}")
     return None
 
 def get_available_ram():
@@ -150,7 +151,7 @@ def get_available_ram():
 
         return None
     except Exception as e:
-        print(f"{WARN} Error reading Available RAM: {e}")
+        print(f"    {WARN} Error reading Available RAM: {e}")
         return None
 
 def get_chrome_ram():
@@ -182,7 +183,7 @@ def get_chrome_ram():
             return total_kb // 1024
 
     except Exception as e:
-        print(f"{WARN} Error reading Chrome RAM: {e}")
+        print(f"    {WARN} Error reading Chrome RAM: {e}")
 
     return 0
 
@@ -216,7 +217,7 @@ def get_cpu_usage():
                             raw_idle = parts[i - 1].replace(',', '.').replace('%', '').strip()
                             return round(100.0 - float(raw_idle), 1)
     except Exception as e:
-        print(f"{WARN} Error reading CPU usage: {e}")
+        print(f"    {WARN} Error reading CPU usage: {e}")
     return 0.0
 
 def get_valid_input(prompt, current_val, min_val, max_val, is_float=False):
@@ -228,9 +229,9 @@ def get_valid_input(prompt, current_val, min_val, max_val, is_float=False):
         val = float(user_val) if is_float else int(user_val)
         if min_val <= val <= max_val:
             return val
-        print(f"{WARN} Please enter a value between {min_val} and {max_val}.")
+        print(f"    {WARN} Please enter a value between {min_val} and {max_val}.")
     except ValueError:
-        print(f"{WARN} Invalid input. No changes made.")
+        print(f"    {WARN} Invalid input. No changes made.")
     return current_val
 
 def validate_url(url):
@@ -269,6 +270,7 @@ class ChromeManager:
         self.show_metrics = True
         self.play_alerts = True
         self.use_stable_load_cutoff = False
+        self.thread_allocation = DEFAULT_THREAD_ALLOCATION
         self.auto_split_windows = DEFAULT_AUTO_SPLIT
         self.max_tabs_per_window = DEFAULT_MAX_TABS
         self.min_ram_threshold = DEFAULT_RAM_THRESHOLD
@@ -281,8 +283,9 @@ class ChromeManager:
         self.active_urls = []
         self.load_presets()
 
-        # Cache Total RAM
+        # Cache Total RAM and Logical threads
         self.total_sys_ram = get_total_ram()
+        self.logical_cores = os.cpu_count() or 4  # Fallback to 4
 
         # Build the initial OS command string
         self.cmd_base = ""
@@ -319,8 +322,7 @@ class ChromeManager:
             sys.exit(1)
 
         # Configuration Tweaks
-        logical_cores = os.cpu_count() or 4 # Fallback to 4
-        render_process_limit = max(1, int(logical_cores * 0.46)) # Sets the limit to 46% of logical threads (approx. 1 process per physical core)
+        render_process_limit = max(1, int(self.logical_cores * (self.thread_allocation / 100))) # Allocates a percentage of logical threads
 
         chrome_tweaks = ['--test-type',                                         # Hide warnings
                          '--disable-features=HighEfficiencyMode',               # Prevents Chrome's memory efficiency
@@ -350,13 +352,13 @@ class ChromeManager:
                             if validate_url(line_cleaned):
                                 urls.append(line_cleaned)
                             else:
-                                print(f"{WARN} Skipped misformatted URL entry: {line_cleaned}")
+                                print(f"    {WARN} Skipped misformatted URL entry: {line_cleaned}")
                 if urls:
                     self.active_urls = urls
                     print(f"[+] Loaded {len(urls)} validated custom URLs from '{CUSTOM_URLS_FILE}'.")
                     return
             except Exception as e:
-                print(f"{WARN} Could not read '{CUSTOM_URLS_FILE}': {e}")
+                print(f"    {WARN} Could not read '{CUSTOM_URLS_FILE}': {e}")
 
         # Fallback urls
         self.active_urls = DEFAULT_PRESETS
@@ -382,7 +384,7 @@ class ChromeManager:
     def add_tabs_to_active_window(self, num_tabs):
         """Adds X more tabs to the active window"""
         if not self.windows:
-            print(f"\n{WARN} No windows tracked yet! Creating a new window instead.")
+            print(f"\n    {WARN} No windows tracked yet! Creating a new window instead.")
             self.create_window(num_tabs)
             return
 
@@ -404,7 +406,7 @@ class ChromeManager:
 
         while tab_queue:
             if not self._is_safe_to_open():
-                print(f"\n{WARN} Stopping {action_text}. {tabs_opened} tabs were opened.")
+                print(f"\n    {WARN} Stopping {action_text}. {tabs_opened} tabs were opened.")
                 break
 
             # Calculate space left in the active window
@@ -445,11 +447,11 @@ class ChromeManager:
             action_type = "New" if force_new_window else "add"
             self.print_metrics(original_chrome_ram, tabs_opened, action_type)
         else:
-            print(f"\n{WARN} Safety trigger prevented any tabs from opening. No metrics recorded.")
+            print(f"\n    {WARN} Safety trigger prevented any tabs from opening. No metrics recorded.")
 
     def kill_chrome(self):
         """Emergency kill switch for all Chrome processes."""
-        print(f"\n{WARN} KILLING ALL CHROME PROCESSES...")
+        print(f"\n    {WARN} KILLING ALL CHROME PROCESSES...")
         try:
             if self.current_os == Platform.WIN:
                 subprocess.run(["taskkill", "/F", "/IM", "chrome.exe", "/T"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -458,7 +460,7 @@ class ChromeManager:
             elif self.current_os == Platform.LINUX:
                 subprocess.run(["killall", "chrome"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
-            print(f"{WARN} Issue encountered firing killswitch: {e}")
+            print(f"    {WARN} Issue encountered firing killswitch: {e}")
 
         # Reset trackers
         self.windows = []
@@ -500,7 +502,7 @@ class ChromeManager:
                     b_type = "NEW WINDOW" if blast["type"] == "New" else "INJECT"
                     f.write(f"Blast {i + 1} [{b_type}]: {blast['tabs']} tabs [Consumed: {blast['ram_consumed']:,} MB]\n")
         except IOError as e:
-            print(f"\n{WARN} Error writing to log file: {e}")
+            print(f"\n    {WARN} Error writing to log file: {e}")
 
         file_exists = os.path.isfile(self.csv_file)
         try:
@@ -511,7 +513,7 @@ class ChromeManager:
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 f.write(f"{timestamp},{len(self.blasts)},{total_tabs},{chrome_ram},{available_ram if available_ram is not None else 'NaN'},{cpu_val}\n")
         except IOError as e:
-            print(f"\n{WARN} Error writing to CSV file: {e}")
+            print(f"\n    {WARN} Error writing to CSV file: {e}")
 
         return cpu_val
 
@@ -563,7 +565,7 @@ class ChromeManager:
 
         if current_free < self.min_ram_threshold:
             if self.play_alerts: print("\a")
-            print(f"\n{WARN} MAX STABLE LOAD: Available RAM ({current_free:,} MB) is below threshold ({self.min_ram_threshold} MB).")
+            print(f"\n    {WARN} MAX STABLE LOAD: Available RAM ({current_free:,} MB) is below threshold ({self.min_ram_threshold} MB).")
             return False
         return True
 
@@ -573,7 +575,7 @@ class ChromeManager:
             full_command = self.cmd_base + args
             subprocess.Popen(full_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
-            print(f"{WARN} Shell initialization error: {e}")
+            print(f"    {WARN} Shell initialization error: {e}")
 
     @staticmethod
     def _fmt_ram(value):
@@ -613,7 +615,11 @@ class ChromeManager:
         """Restores configurable preferences"""
 
         # Check if core browser flags have been altered
-        needs_restart = (self.disable_gpu is not False) or (self.open_incognito != self.default_incognito)
+        needs_restart = (
+                (self.disable_gpu is not False) or
+                (self.open_incognito != self.default_incognito) or
+                (self.thread_allocation != DEFAULT_THREAD_ALLOCATION)
+        )
 
         if needs_restart:
             confirm = input(
@@ -625,6 +631,7 @@ class ChromeManager:
             self.kill_chrome()
             self.disable_gpu = False
             self.open_incognito = self.default_incognito
+            self.thread_allocation = DEFAULT_THREAD_ALLOCATION
             self.build_cmd_base()
 
         # Reset standard variables
@@ -650,7 +657,7 @@ def main():
     print(f"{LTT_ORANGE}" + "=" * 40 + f"{RESET_COLOR}")
     print("It is highly recommended to run this program in Incognito mode.")
 
-    incognito_prompt = input(f"{WARN} Would you like to use Chrome Incognito? (Y/n): ")
+    incognito_prompt = input(f"    {WARN} Would you like to use Chrome Incognito? (Y/n): ")
     use_incognito = incognito_prompt.strip().lower() != 'n'
     current_state = "open incognito." if use_incognito else "open your personal profile."
     print(f"    -> Chrome will {current_state}")
@@ -678,7 +685,7 @@ def main():
                 try:
                     num = int(input("How many tabs? "))
                     if num > 500:
-                        confirm = input(f"{WARN} Are you sure you want to open {num} tabs? (y/N): ")
+                        confirm = input(f"    {WARN} Are you sure you want to open {num} tabs? (y/N): ")
                         if confirm.strip().lower() != 'y':
                             print("    [+] Action cancelled.")
                             continue
@@ -691,10 +698,10 @@ def main():
                     else:
                         print("Please enter a number greater than 0.")
                 except ValueError:
-                    print("Invalid input. Please enter a number.")
+                    print(f"    {WARN} Invalid input. Please enter a number.")
 
             elif choice == '3':
-                confirm = input(f"{WARN} This will forcefully close ALL Chrome windows. Proceed? (y/N): ")
+                confirm = input(f"    {WARN} This will forcefully close ALL Chrome windows. Proceed? (y/N): ")
                 if confirm.lower() == 'y':
                     manager.kill_chrome()
                 else:
@@ -720,7 +727,7 @@ def main():
                     with open(manager.log_file, 'r') as f:
                         print(f.read())
                 else:
-                    print(f"\n{WARN} No log file found.")
+                    print(f"\n    {WARN} No log file found.")
 
             elif choice == '5':
                 while True:
@@ -733,6 +740,9 @@ def main():
                     incognito_state = color_state(manager.open_incognito)
                     gpu_state = color_state(not manager.disable_gpu)
                     cache_state = color_state(manager.fight_cache)
+
+                    # Current Thread Allocation
+                    cur_allocated = max(1, int(manager.logical_cores * (manager.thread_allocation / 100)))
 
                     print("\n--- Configuration Menu ---")
                     print(f"1. Toggle Terminal Metrics [Current: {metrics_state}]")
@@ -748,12 +758,13 @@ def main():
                     print(f"10. Change Cooldown between Chunks [{manager.cooldown}s]")
                     print(f"11. Change Chunk Size [{manager.chunk_size} tabs]")
                     print(f"12. Change RAM Safety Threshold [{manager.min_ram_threshold} MB]")
-                    print("13. Reload Custom URLs File")
-                    print("14. Reset to Defaults")
+                    print(f"13. Change Thread Allocation Percentage [{manager.thread_allocation}% | {cur_allocated} Threads]")
+                    print("14. Reload Custom URLs File")
+                    print("15. Reset to Defaults")
                     print("-" * 40)
                     print("0. Go Back\n")
 
-                    sub_choice = input("Select a setting to toggle (1-14) or 0 to return: ").strip()
+                    sub_choice = input("Select a setting to toggle (1-15) or 0 to return: ").strip()
                     if sub_choice == '1':
                         manager.show_metrics = not manager.show_metrics
                         print(f"    [+] Terminal metrics toggled {color_state(manager.show_metrics)}.")
@@ -800,28 +811,38 @@ def main():
                     elif sub_choice == '12':
                         manager.min_ram_threshold = get_valid_input("Minimum RAM to trigger Safety Threshold (100 - 5000 MB)", manager.min_ram_threshold, 100, 5000)
                     elif sub_choice == '13':
-                        manager.load_presets()
+                        confirm = input(f"    {WARN} Adjusting this feature will shut down Chrome. Proceed? (y/N): ")
+                        if confirm.lower() == 'y':
+                            manager.kill_chrome()
+                            manager.thread_allocation = get_valid_input("Thread Allocation percentage (1 - 100%)", manager.thread_allocation, 1, 100)
+                            manager.build_cmd_base()
+                            allocated_threads = max(1, int(manager.logical_cores * (manager.thread_allocation / 100)))
+                            print(f"    [+] Chrome will allocate {manager.thread_allocation}% of Logical CPU Cores ({allocated_threads} threads)")
+                        else:
+                            print(f"    [+] Thread allocation will remain at {manager.thread_allocation}% ({cur_allocated} threads)")
                     elif sub_choice == '14':
+                        manager.load_presets()
+                    elif sub_choice == '15':
                         manager.reset_to_defaults()
                     elif sub_choice == '0':
                         break
                     else:
-                        print(f"{WARN} Invalid choice.")
+                        print(f"    {WARN} Invalid choice.")
 
             elif choice == '0':
                 print("\nExiting script.")
                 break
 
             else:
-                print(f"\n{WARN} Invalid choice. Try again.")
+                print(f"\n    {WARN} Invalid choice. Try again.")
     except KeyboardInterrupt:
-        print(f"\n{WARN} Stress test interrupted by user.")
+        print(f"\n    {WARN} Stress test interrupted by user.")
     finally:
         print("Finalizing session logs...")
         archive_log(manager.log_file)
         archive_log(manager.csv_file)
 
-        kill_processes = input(f"{WARN} Would you like to kill ALL Chrome processes? (y/N): ")
+        kill_processes = input(f"    {WARN} Would you like to kill ALL Chrome processes? (y/N): ")
         if kill_processes.lower() == 'y':
             manager.kill_chrome()
         else:
