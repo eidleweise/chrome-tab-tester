@@ -7,7 +7,7 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.2.5
+Version: 1.2.6
 Created: 2026-03-20
 Updated: 2026-06-07
 """
@@ -569,14 +569,15 @@ class ChromeManager:
         else:
             print(f"{SUCCESS} Success: INJECTED {num_tabs} tabs into the active window.")
 
+        # Log to CSV after blast
+        self.log_csv_checkpoint(1.0)
+
         self.blasts.append({
             "type": action_type,
             "tabs": num_tabs,
             "ram_consumed": raw_ram_delta
         })
 
-        # Log to CSV after blast
-        self.log_csv_checkpoint(1.0)
         cpu_val = self.update_log(free_ram, current_chrome_ram)
 
         if self.show_metrics:
