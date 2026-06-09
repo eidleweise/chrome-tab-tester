@@ -7,9 +7,9 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.2.6
+Version: 1.2.7
 Created: 2026-03-20
-Updated: 2026-06-07
+Updated: 2026-06-08
 """
 
 import sys
@@ -20,6 +20,7 @@ import os
 import re
 import time
 import math
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
@@ -48,9 +49,9 @@ DEFAULT_COOLDOWN = 0.3 # Between chunks
 DEFAULT_RAM_THRESHOLD = 500
 DEFAULT_CHUNK_SIZE = 1
 DEFAULT_AUTO_SPLIT = True
-DEFAULT_MAX_TABS = 500
+DEFAULT_MAX_TABS = 1000
 DEFAULT_URL_RANDOMIZATION = False
-DEFAULT_THREAD_ALLOCATION = 88 # Leaving some headroom for the OS
+DEFAULT_THREAD_ALLOCATION = 46 # Allocating half of threads + leaving some headroom for the OS.
 DEFAULT_LOG_GRANULARITY = 1 # 1 = end sample only. 5 = 4 mid-points + 1 end sample
 
 # ANSI Color Codes
@@ -62,7 +63,7 @@ RESET_COLOR = "\033[0m"
 INDENT = "    "
 INFO = f"{YELLOW}[i]{RESET_COLOR}"
 SUCCESS = f"{GREEN}[+]{RESET_COLOR}"
-WARN = f"{INDENT}{YELLOW}[!]{RESET_COLOR}"
+WARN = f"{INDENT}{LTT_ORANGE}[!]{RESET_COLOR}"
 
 class Platform(Enum):
     WIN = "Windows"
@@ -70,8 +71,21 @@ class Platform(Enum):
     MAC = "Mac"
 
 # ==========================================
-# SYSTEM UTILITY FUNCTIONS
+# SYSTEM UTILITY CLASSES & FUNCTIONS
 # ==========================================
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
 def archive_log(file):
     """Moves a specific file to the dated logs folder with a timestamp"""
     path_obj = Path(file)
@@ -108,15 +122,16 @@ def get_total_ram():
     """Scrapes commands for Total Installed Physical RAM (in MB)"""
     try:
         if sys.platform.startswith('win'):
-            cmd = ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"]
-            result = subprocess.check_output(cmd, text=True).strip()
-            return int(result) // (1024 * 1024)
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullTotalPhys // (1024 * 1024)
 
         elif sys.platform.startswith('linux'):
-            result = subprocess.check_output(['free', '-m'], text=True)
-            for line in result.splitlines():
-                if line.startswith('Mem:'):
-                    return int(line.split()[1])
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        return int(line.split()[1]) // 1024  # kB → MB
 
         elif sys.platform.startswith('darwin'):
             result = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
@@ -130,16 +145,16 @@ def get_available_ram():
     """Scrapes commands to find currently available RAM"""
     try:
         if sys.platform.startswith('win'):
-            cmd = ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"]
-            result = subprocess.check_output(cmd, text=True).strip()
-            return int(result) // 1024
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))  # type: ignore[attr-defined]
+            return stat.ullAvailPhys // (1024 * 1024)
 
         elif sys.platform.startswith('linux'):
-            result = subprocess.check_output(['free', '-m'], text=True)
-            for line in result.splitlines():
-                if line.startswith('Mem:'):
-                    parts = line.split()
-                    return int(parts[6]) if len(parts) > 6 else int(parts[3]) # "available" column (util-linux 3.x+, Linux 3.14+)
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        return int(line.split()[1]) // 1024  # kB → MB
 
         elif sys.platform.startswith('darwin'):
             page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True).strip())
@@ -207,22 +222,27 @@ def get_cpu_usage():
             result = subprocess.check_output(cmd, text=True).strip()
             cpu_lines = [line for line in result.splitlines() if line.startswith('CPU usage:')]
             if cpu_lines:
-                parts = cpu_lines[-1].split()
-                for i, p in enumerate(parts):
+                mac_parts = cpu_lines[-1].split()
+                for i, p in enumerate(mac_parts):
                     if 'idle' in p:
-                        idle = float(parts[i - 1].replace('%', ''))
-                        return round(100.0 - idle, 1)
+                        mac_idle = float(mac_parts[i - 1].replace('%', ''))
+                        return round(100.0 - mac_idle, 1)
 
         elif sys.platform.startswith('linux'):
-            top_output = subprocess.check_output(["top", "-bn1"], text=True)
-            for line in top_output.splitlines():
-                if "Cpu(s)" in line:
-                    parts = line.split()
-                    for i, p in enumerate(parts):
-                        token = p.rstrip(',').lower()
-                        if token in ('id', 'idle'):
-                            raw_idle = parts[i - 1].replace(',', '.').replace('%', '').strip()
-                            return round(100.0 - float(raw_idle), 1)
+            def _read_cpu_stat():
+                with open('/proc/stat', 'r') as f:
+                    linux_parts = f.readline().split()
+                values = list(map(int, linux_parts[1:]))
+                linux_idle = values[3] + (values[4] if len(values) > 4 else 0)
+                return sum(values), linux_idle
+            t1, i1 = _read_cpu_stat()
+            time.sleep(0.1)
+            t2, i2 = _read_cpu_stat()
+
+            delta_total = t2 - t1
+            delta_idle = i2 - i1
+
+            return round(100.0 * (1 - delta_idle / delta_total), 1) if delta_total else 0.0
     except Exception as e:
         print(f"{WARN} Error reading CPU usage: {e}")
     return 0.0
@@ -482,7 +502,7 @@ class ChromeManager:
         self.windows = []
         self.blasts = []
         self.peak_chrome_ram = 0
-        print(f"{INDENT}{SUCCESS} Consider Chrome dead.")
+        print(f"{INDENT}{SUCCESS} Consider Chrome dead.\n")
 
     def log_csv_checkpoint(self, progress_pct):
         """Logs interval data to CSV"""
@@ -800,7 +820,7 @@ def main():
                     print(f"11. Change Chunk Size                   | {manager.chunk_size} tabs")
                     print(f"12. Change RAM Safety Threshold         | {manager.min_ram_threshold} MB")
                     print(f"13. Change Thread Allocation Percentage | {manager.thread_allocation}% | {manager.allocated_renderers} Threads")
-                    print(f"14. Change Logging Granularity          | {manager.log_granularity} interval(s)")
+                    print(f"14. Change Logging Granularity          | {manager.log_granularity} interval(s) per blast")
                     print("-" * 40 + "|" + "-" * 18)
                     print("15. Reload Custom URLs File             |")
                     print("16. Reset to Defaults                   |")
