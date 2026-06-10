@@ -7,9 +7,9 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.2.7
+Version: 1.2.8
 Created: 2026-03-20
-Updated: 2026-06-08
+Updated: 2026-06-09
 """
 
 import sys
@@ -33,7 +33,6 @@ from urllib.parse import urlparse, urlunparse
 # Curated Websites
 DEFAULT_PRESETS = [
     "https://earth.google.com/web/",  # Heavy WebGL
-    "https://www.shadertoy.com/",  # Heavy GPU/RAM rendering
     "https://www.twitch.tv/",  # Autoplay video/chat scripts
     "https://www.youtube.com/",  # Video player overhead
     "https://twitter.com/",  # Infinite scrolling SPA
@@ -51,19 +50,21 @@ DEFAULT_CHUNK_SIZE = 1
 DEFAULT_AUTO_SPLIT = True
 DEFAULT_MAX_TABS = 1000
 DEFAULT_URL_RANDOMIZATION = False
-DEFAULT_THREAD_ALLOCATION = 46 # Allocating half of threads + leaving some headroom for the OS.
+DEFAULT_THREAD_ALLOCATION = 46 # Allocating nearly half of threads while leaving some headroom for the OS.
 DEFAULT_LOG_GRANULARITY = 1 # 1 = end sample only. 5 = 4 mid-points + 1 end sample
 
 # ANSI Color Codes
 LTT_ORANGE = "\033[38;2;243;111;33m"
-GREEN = "\033[92m"
+GRAY = "\033[90m"
 RED = "\033[91m"
+GREEN = "\033[92m"
 YELLOW = "\033[93m"
 RESET_COLOR = "\033[0m"
 INDENT = "    "
 INFO = f"{YELLOW}[i]{RESET_COLOR}"
 SUCCESS = f"{GREEN}[+]{RESET_COLOR}"
 WARN = f"{INDENT}{LTT_ORANGE}[!]{RESET_COLOR}"
+NOTE = "[*]"
 
 class Platform(Enum):
     WIN = "Windows"
@@ -104,7 +105,7 @@ def archive_log(file):
 
 def animated_loading(duration):
     """Displays an animated terminal loading bar for a set duration"""
-    steps = int(duration * 10)
+    steps = max(1, int(duration * 10))
     bar_length = 30
 
     for i in range(steps + 1):
@@ -124,7 +125,7 @@ def get_total_ram():
         if sys.platform.startswith('win'):
             stat = _MEMORYSTATUSEX()
             stat.dwLength = ctypes.sizeof(stat)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) # type: ignore[attr-defined]
             return stat.ullTotalPhys // (1024 * 1024)
 
         elif sys.platform.startswith('linux'):
@@ -182,7 +183,8 @@ def get_chrome_ram():
         if sys.platform.startswith('win'):
             cmd = ["powershell", "-NoProfile", "-Command", "(Get-Process chrome -ErrorAction SilentlyContinue | Measure-Object WorkingSet -Sum).Sum"]
             result = subprocess.check_output(cmd, text=True).strip()
-            if not result: return 0
+            if not result:
+                return 0
             return int(result) // (1024 * 1024)  # Convert Bytes to MB
 
         elif sys.platform.startswith('darwin') or sys.platform.startswith('linux'):
@@ -251,7 +253,8 @@ def get_valid_input(prompt, current_val, min_val, max_val, is_float=False):
     """Validates numerical inputs from configuration prompts"""
     print(f"\n{YELLOW}[Current Value:{RESET_COLOR} {current_val}{YELLOW}]{RESET_COLOR}")
     user_val = input(prompt + " (Press ENTER to keep current value): ").strip()
-    if not user_val: return current_val
+    if not user_val:
+        return current_val
     try:
         val = float(user_val) if is_float else int(user_val)
         if min_val <= val <= max_val:
@@ -331,19 +334,25 @@ class ChromeManager:
                 os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
                 os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe")
             ]
-            chrome_path = next((p for p in paths if Path(p).exists()), None)
+            win_chrome_path = next((p for p in paths if Path(p).exists()), None)
 
-            # Fallback to system path lookup
-            if not chrome_path:
-                chrome_path = shutil.which("chrome") or "chrome.exe"
+            if not win_chrome_path:
+                win_chrome_path = shutil.which("chrome") or "chrome.exe"
 
-            self.cmd_base = [chrome_path]
+            self.cmd_base = [win_chrome_path]
             self.current_os = Platform.WIN
         elif sys.platform.startswith('linux'):
-            self.cmd_base = ['google-chrome']
+            chrome_names = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']
+            linux_chrome_path = next((name for name in chrome_names if shutil.which(name)), 'google-chrome')
+            self.cmd_base = [linux_chrome_path]
             self.current_os = Platform.LINUX
         elif sys.platform.startswith('darwin'):
-            self.cmd_base = ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
+            mac_chrome_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+            if not Path(mac_chrome_path).exists():
+                mac_chrome_path = shutil.which("Google Chrome") or shutil.which("chrome") or mac_chrome_path
+
+            self.cmd_base = [mac_chrome_path]
             self.current_os = Platform.MAC
         else:
             print("Unsupported OS. This script is designed for Windows, Mac, and Linux.")
@@ -351,6 +360,8 @@ class ChromeManager:
 
         # Chrome Configuration Tweaks
         chrome_tweaks = ['--test-type',                                             # Hide warnings
+                         '--no-first-run',                                          # Suppresses Chrome's "Welcome" setup dialog
+                         '--no-default-browser-check',                              # Stops the "make Chrome your default" prompt
                          '--disable-features=HighEfficiencyMode',                   # Prevents Chrome's memory efficiency
                          '--disable-site-isolation-trials',                         # Prevents 3rd Party Process bloat
                          '--disable-backgrounding-occluded-windows',                # Prevents Chrome from unrendering hidden tabs
@@ -366,7 +377,7 @@ class ChromeManager:
             self.cmd_base.append('--incognito')
 
     def load_presets(self):
-        """Parses targets.txt for custom URLs. Uses 'PRESETS' otherwise."""
+        """Parses custom_urls.txt for custom URLs. Uses 'DEFAULT_PRESETS' otherwise."""
         if CUSTOM_URLS_FILE.exists():
             try:
                 with open(CUSTOM_URLS_FILE, 'r', encoding='utf-8') as f:
@@ -381,6 +392,10 @@ class ChromeManager:
                 if urls:
                     self.active_urls = urls
                     return f"{SUCCESS} Loaded {len(urls)} validated custom URLs from '{CUSTOM_URLS_FILE}'."
+
+                else:
+                    self.active_urls = DEFAULT_PRESETS
+                    return f"{WARN} '{CUSTOM_URLS_FILE}' found but contained no valid URLs. Using defaults."
             except Exception as e:
                 return f"{WARN} Could not read '{CUSTOM_URLS_FILE}': {e}"
 
@@ -397,9 +412,9 @@ class ChromeManager:
                 f.write("# Below is the default preset:\n\n")
                 for url in DEFAULT_PRESETS:
                     f.write(f"{url}\n")
-            return f"[*] Generated example '{CUSTOM_URLS_FILE}' and loaded default presets."
+            return f"{NOTE} Generated example '{CUSTOM_URLS_FILE}' and loaded default presets."
         except Exception as e:
-            return f"[*] Loaded default preset. (Could not generate example file: {e})"
+            return f"{NOTE} Loaded default preset. (Could not generate example file: {e})"
 
     def create_window(self, num_tabs):
         """Creates a new Chrome window with specifiable number of tabs"""
@@ -422,7 +437,7 @@ class ChromeManager:
             tab_queue = random.choices(self.active_urls, k=num_tabs)
 
         action_text = "blast" if force_new_window else "inject"
-        print(f"\n[*] Preparing to {action_text} {num_tabs} tabs. This may take a moment...")
+        print(f"\n{NOTE} Preparing to {action_text} {num_tabs} tabs. This may take a moment...")
 
         original_chrome_ram = get_chrome_ram()
         tabs_opened = 0
@@ -552,16 +567,16 @@ class ChromeManager:
 
         try:
             with open(self.log_file, 'w') as f:
-                f.write(f"========================================\n")
-                f.write(f" CHROME TAB TESTER RAM USAGE \n")
-                f.write(f"========================================\n")
+                f.write("========================================\n")
+                f.write(" CHROME TAB TESTER RAM USAGE \n")
+                f.write("========================================\n")
                 f.write(f"Last Updated  : {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}\n")
                 f.write(f"System RAM    : {avail_display} MB free / {sys_display} MB total\n")
                 f.write(f"Chrome RAM    : {chrome_ram:,} MB\n")
                 f.write(f"Total Blasts  : {len(self.blasts)}\n")
                 f.write(f"Total Windows : {total_windows}\n")
                 f.write(f"Total Tabs    : {total_tabs}\n")
-                f.write(f"----------------------------------------\n")
+                f.write("----------------------------------------\n")
 
                 for i, blast in enumerate(self.blasts):
                     b_type = "NEW WINDOW" if blast["type"] == "New" else "INJECT"
@@ -583,7 +598,8 @@ class ChromeManager:
         trend = "GREW by" if raw_ram_delta >= 0 else "RECLAIMED"
         abs_ram_delta = abs(raw_ram_delta)
 
-        if self.play_alerts: print("\a")
+        if self.play_alerts:
+            print("\a")
         if action_type == "New":
             print(f"{SUCCESS} Success: Chrome window created with {num_tabs} tabs.")
         else:
@@ -617,7 +633,7 @@ class ChromeManager:
         return max(1, int(self.logical_cores * (self.thread_allocation / 100)))
 
     def _is_safe_to_open(self):
-        """Stops opening tabs if available RAM falls below threshhold"""
+        """Stops opening tabs if available RAM falls below the threshold"""
         if not self.use_stable_load_cutoff:
             return True
 
@@ -626,7 +642,8 @@ class ChromeManager:
             return True
 
         if current_free < self.min_ram_threshold:
-            if self.play_alerts: print("\a")
+            if self.play_alerts:
+                print("\a")
             print(f"\n{WARN} MAX STABLE LOAD: Available RAM ({current_free:,} MB) is below threshold ({self.min_ram_threshold} MB).")
             return False
         return True
@@ -710,6 +727,166 @@ class ChromeManager:
 
         return f"{SUCCESS} Configuration reset to default values."
 
+def display_metrics(manager):
+    """Prints a live system snapshot and the last written log report to the terminal"""
+    # Scrape current metrics
+    cur_ram = get_chrome_ram()
+    cur_cpu = get_cpu_usage()
+
+    # Force update Peak RAM if applicable
+    if cur_ram > manager.peak_chrome_ram:
+        manager.peak_chrome_ram = cur_ram
+    peak_display = f"{manager.peak_chrome_ram:,} MB" if manager.peak_chrome_ram > 0 else "No data yet."
+
+    print(f"\n--- SYSTEM SNAPSHOT [{datetime.now().strftime('%I:%M:%S %p')}] ---")
+    print(f"Session Peak RAM Usage: {peak_display}")
+    print(f"Current Chrome RAM Usage: {cur_ram:,} MB")
+    print(f"Current CPU Load:  {cur_cpu}%")
+
+    if manager.log_file.exists():
+        print("\n--- LAST LOGGED REPORT ---")
+        try:
+            with open(manager.log_file, 'r') as f:
+                print(f.read())
+        except IOError as e:
+            print(f"{WARN} Could not read log file: {e}")
+    else:
+        print(f"\n{WARN} No log file found.")
+
+def handle_settings_menu(manager):
+    """Renders the configuration menu and processes user input"""
+    feedback_message = ""
+
+    while True:
+        # State readout
+        metrics_state = color_state(manager.show_metrics)
+        wait_state = f"{GREEN}AUTO{RESET_COLOR}" if manager.wait_mode == "auto" else f"{RED}MANUAL{RESET_COLOR}"
+        alert_state = color_state(manager.play_alerts)
+        cutoff_state = color_state(manager.use_stable_load_cutoff)
+        split_state = color_state(manager.auto_split_windows)
+        incognito_state = color_state(manager.open_incognito)
+        gpu_state = color_state(not manager.disable_gpu)
+        cache_state = color_state(manager.randomize_urls)
+
+        # Conditional coloring for toggle dependent settings
+        split_color = RESET_COLOR if manager.auto_split_windows else GRAY
+        split_hint = "" if manager.auto_split_windows else "(Toggle Auto-Split Windows to enable)"
+        cutoff_color = RESET_COLOR if manager.use_stable_load_cutoff else GRAY
+        cutoff_hint = "" if manager.use_stable_load_cutoff else "(Toggle Safety Cutoff to enable)"
+
+        print("\n" + "-" * 10 + " Configuration Menu " + "-" * 28)
+        print(f"1. Toggle Terminal Metrics              | {metrics_state}")
+        print(f"2. Toggle Audio Alerts                  | {alert_state}")
+        print(f"3. Toggle Loading Mode                  | {wait_state}")
+        print(f"4. Toggle Cache Busting                 | {cache_state}")
+        print(f"5. Toggle Auto-Split Windows            | {split_state}")
+        print(f"6. Toggle Safety Cutoff                 | {cutoff_state}")
+        print(f"7. Toggle Incognito Mode                | {incognito_state}")
+        print(f"8. Toggle Hardware Acceleration         | {gpu_state}")
+        print("-" * 40 + "|" + "-" * 18)
+        print(f"9.  Change Chunk Size                   | {manager.chunk_size} tabs")
+        print(f"10. Change Cooldown between Chunks      | {manager.cooldown}s")
+        print(f"{split_color}11. Change Tab Limit per Window         | {manager.max_tabs_per_window} tabs           {split_hint}{RESET_COLOR}")
+        print(f"{cutoff_color}12. Change RAM Safety Threshold         | {manager.min_ram_threshold} MB              {cutoff_hint}{RESET_COLOR}")
+        print(f"13. Change Thread Allocation Percentage | {manager.thread_allocation}% | {manager.allocated_renderers} Threads")
+        print(f"14. Change Logging Granularity          | {manager.log_granularity} interval(s) per blast")
+        print("-" * 40 + "|" + "-" * 18)
+        print("15. Reload Custom URLs File             |")
+        print("16. Reset to Defaults                   |")
+        print("-" * 60)
+        print("0. Go Back\n")
+
+        if feedback_message:
+            print(f"{feedback_message}")
+            feedback_message = ""
+        sub_choice = input("Select a setting to modify (1-16) or 0 to return: ").strip()
+
+        if sub_choice == '1':
+            manager.show_metrics = not manager.show_metrics
+            feedback_message = f"{SUCCESS} Terminal metrics toggled {color_state(manager.show_metrics)}."
+            feedback_message += f"\n{INDENT}{INFO} CSV logging will continue in the background."
+        elif sub_choice == '2':
+            manager.play_alerts = not manager.play_alerts
+            feedback_message = f"{SUCCESS} Audio Alerts toggled {color_state(manager.play_alerts)}."
+        elif sub_choice == '3':
+            manager.wait_mode = "manual" if manager.wait_mode == "auto" else "auto"
+            new_state = f"{GREEN}AUTO{RESET_COLOR}" if manager.wait_mode == "auto" else f"{RED}MANUAL{RESET_COLOR}"
+            feedback_message = f"{SUCCESS} Render wait mode toggled to {new_state}."
+        elif sub_choice == '4':
+            manager.randomize_urls = not manager.randomize_urls
+            feedback_message = f"{SUCCESS} Cache busting toggled {color_state(manager.randomize_urls)}."
+        elif sub_choice == '5':
+            manager.auto_split_windows = not manager.auto_split_windows
+            feedback_message = f"{SUCCESS} Auto-Split windows toggled {color_state(manager.auto_split_windows)}."
+        elif sub_choice == '6':
+            manager.use_stable_load_cutoff = not manager.use_stable_load_cutoff
+            feedback_message = f"{SUCCESS} Safety Cutoff toggled {color_state(manager.use_stable_load_cutoff)}."
+        elif sub_choice == '7':
+            confirm = input(f"{WARN} Toggling this feature will shut down Chrome. Proceed? (y/N): ")
+            if confirm.lower() == 'y':
+                manager.kill_chrome()
+                manager.open_incognito = not manager.open_incognito
+                manager.build_cmd_base()
+                feedback_message = f"{SUCCESS} Incognito Mode toggled {color_state(manager.open_incognito)}."
+            else:
+                feedback_message = f"{SUCCESS} Incognito Mode will remain {color_state(manager.open_incognito)}"
+        elif sub_choice == '8':
+            confirm = input(f"{WARN} Toggling this feature will shut down Chrome. Proceed? (y/N): ")
+            if confirm.lower() == 'y':
+                manager.kill_chrome()
+                manager.disable_gpu = not manager.disable_gpu
+                manager.build_cmd_base()
+                feedback_message = f"{SUCCESS} Hardware Acceleration toggled {color_state(manager.disable_gpu)}"
+            else:
+                feedback_message = f"{SUCCESS} Hardware Acceleration will remain {color_state(manager.disable_gpu)}"
+
+        elif sub_choice == '9':
+            print(
+                f"\n{INFO} Tabs to open simultaneously. High values may choke CPUs due to IPC overhead. (Default: {DEFAULT_CHUNK_SIZE})")
+            manager.chunk_size = get_valid_input("New chunk size (1 - 1000 tabs)", manager.chunk_size, 1, 1000)
+            feedback_message = f"{SUCCESS} Chunk size updated to {manager.chunk_size}."
+        elif sub_choice == '10':
+            print(
+                f"\n{INFO} The pause duration between batch tab injections to allow the OS scheduler to catch up. (Default: {DEFAULT_COOLDOWN})")
+            manager.cooldown = get_valid_input("Cooldown between chunks (0.0s - 60.0s)", manager.cooldown, 0.0, 60.0,
+                                               True)
+            feedback_message = f"{SUCCESS} Cooldown updated to {manager.cooldown}s."
+        elif sub_choice == '11':
+            print(
+                f"\n{INFO} Chrome may become unstable with too many tabs per window. This sets the limit before splitting. (Default: {DEFAULT_MAX_TABS})")
+            manager.max_tabs_per_window = get_valid_input("Max tabs before splitting (5 - 5000)", manager.max_tabs_per_window, 5, 5000)
+            feedback_message = f"{SUCCESS} Tab limit updated to {manager.max_tabs_per_window}."
+        elif sub_choice == '12':
+            print(
+                f"\n{INFO} Failsafe to prevent the OS from hard-crashing by halting injection if free memory dips too low. (Default: {DEFAULT_RAM_THRESHOLD} MB)")
+            manager.min_ram_threshold = get_valid_input("Minimum RAM to trigger Safety Threshold (100 - 5000 MB)",
+                                                        manager.min_ram_threshold, 100, 5000)
+            feedback_message = f"{SUCCESS} RAM threshold updated to {manager.min_ram_threshold} MB."
+        elif sub_choice == '13':
+            confirm = input(f"{WARN} Adjusting this feature will shut down Chrome. Proceed? (y/N): ")
+            if confirm.lower() == 'y':
+                manager.kill_chrome()
+                print(
+                    f"{INDENT}{INFO} Caps Chrome's allowed renderer processes relative to your total logical cores. (Default: {DEFAULT_THREAD_ALLOCATION}%)")
+                manager.thread_allocation = get_valid_input("Thread Allocation percentage (1 - 100%)",
+                                                            manager.thread_allocation, 1, 100)
+                manager.build_cmd_base()
+                feedback_message = f"{SUCCESS} Chrome will allocate {manager.thread_allocation}% of Logical CPU Cores ({manager.allocated_renderers} threads)."
+            else:
+                feedback_message = f"{SUCCESS} Thread allocation will remain at {manager.thread_allocation}% ({manager.allocated_renderers} threads)."
+        elif sub_choice == '14':
+            print(
+                f"\n{INFO} Mid-blast CSV logging. 1 = End-sample only. Higher numbers = More data points, but may introduce stuttering. (Default: {DEFAULT_LOG_GRANULARITY})")
+            manager.log_granularity = get_valid_input("Logging Granularity (1-5)", manager.log_granularity, 1, 5)
+            feedback_message = f"{SUCCESS} Logging Granularity updated to {manager.log_granularity} interval(s)."
+        elif sub_choice == '15':
+            feedback_message = manager.load_presets()
+        elif sub_choice == '16':
+            feedback_message = manager.reset_to_defaults()
+        elif sub_choice == '0':
+            break
+        else:
+            feedback_message = f"{WARN} Invalid choice."
 
 def main():
 
@@ -770,145 +947,10 @@ def main():
                     print(f"{INDENT}{SUCCESS} Action cancelled.")
 
             elif choice == '4':
-                # Scrape current metrics
-                cur_ram = get_chrome_ram()
-                cur_cpu = get_cpu_usage()
-
-                # Force update Peak RAM if applicable
-                if cur_ram > manager.peak_chrome_ram > 0:
-                    manager.peak_chrome_ram = cur_ram
-                peak_display = f"{manager.peak_chrome_ram:,} MB" if manager.peak_chrome_ram > 0 else "No data yet."
-
-                print(f"\n--- SYSTEM SNAPSHOT [{datetime.now().strftime('%I:%M:%S %p')}] ---")
-                print(f"Session Peak RAM Usage: {peak_display}")
-                print(f"Current Chrome RAM Usage: {cur_ram:,} MB")
-                print(f"Current CPU Load:  {cur_cpu}%")
-
-                if manager.log_file.exists():
-                    print("\n--- LAST LOGGED REPORT ---")
-                    with open(manager.log_file, 'r') as f:
-                        print(f.read())
-                else:
-                    print(f"\n{WARN} No log file found.")
+                display_metrics(manager)
 
             elif choice == '5':
-                feedback_message = ""
-
-                while True:
-                    # State readout
-                    metrics_state = color_state(manager.show_metrics)
-                    wait_state = f"{GREEN}AUTO{RESET_COLOR}" if manager.wait_mode == "auto" else f"{RED}MANUAL{RESET_COLOR}"
-                    alert_state = color_state(manager.play_alerts)
-                    cutoff_state = color_state(manager.use_stable_load_cutoff)
-                    split_state = color_state(manager.auto_split_windows)
-                    incognito_state = color_state(manager.open_incognito)
-                    gpu_state = color_state(not manager.disable_gpu)
-                    cache_state = color_state(manager.randomize_urls)
-
-                    print("\n" + "-" * 10 + " Configuration Menu " + "-" * 28)
-                    print(f"1. Toggle Terminal Metrics              | {metrics_state}")
-                    print(f"2. Toggle Audio Alerts                  | {alert_state}")
-                    print(f"3. Toggle Loading Mode                  | {wait_state}")
-                    print(f"4. Toggle Safety Cutoff                 | {cutoff_state}")
-                    print(f"5. Toggle Auto-Split Windows            | {split_state}")
-                    print(f"6. Toggle Incognito Mode                | {incognito_state}")
-                    print(f"7. Toggle Hardware Acceleration         | {gpu_state}")
-                    print(f"8. Toggle Cache Busting                 | {cache_state}")
-                    print("-" * 40 + "|" + "-" * 18)
-                    print(f"9.  Change Tab Limit per Window         | {manager.max_tabs_per_window} tabs")
-                    print(f"10. Change Cooldown between Chunks      | {manager.cooldown}s")
-                    print(f"11. Change Chunk Size                   | {manager.chunk_size} tabs")
-                    print(f"12. Change RAM Safety Threshold         | {manager.min_ram_threshold} MB")
-                    print(f"13. Change Thread Allocation Percentage | {manager.thread_allocation}% | {manager.allocated_renderers} Threads")
-                    print(f"14. Change Logging Granularity          | {manager.log_granularity} interval(s) per blast")
-                    print("-" * 40 + "|" + "-" * 18)
-                    print("15. Reload Custom URLs File             |")
-                    print("16. Reset to Defaults                   |")
-                    print("-" * 60)
-                    print("0. Go Back\n")
-
-                    if feedback_message:
-                        print(f"{feedback_message}")
-                        feedback_message = ""
-                    sub_choice = input("Select a setting to modify (1-16) or 0 to return: ").strip()
-
-                    if sub_choice == '1':
-                        manager.show_metrics = not manager.show_metrics
-                        feedback_message = f"{SUCCESS} Terminal metrics toggled {color_state(manager.show_metrics)}."
-                        feedback_message += f"\n{INDENT}{INFO} CSV logging will continue in the background."
-                    elif sub_choice == '2':
-                        manager.play_alerts = not manager.play_alerts
-                        feedback_message = f"{SUCCESS} Audio Alerts toggled {color_state(manager.play_alerts)}."
-                    elif sub_choice == '3':
-                        manager.wait_mode = "manual" if manager.wait_mode == "auto" else "auto"
-                        new_state = f"{GREEN}AUTO{RESET_COLOR}" if manager.wait_mode == "auto" else f"{RED}MANUAL{RESET_COLOR}"
-                        feedback_message = f"{SUCCESS} Render wait mode toggled to {new_state}."
-                    elif sub_choice == '4':
-                        manager.use_stable_load_cutoff = not manager.use_stable_load_cutoff
-                        feedback_message = f"{SUCCESS} Safety Cutoff toggled {color_state(manager.use_stable_load_cutoff)}."
-                    elif sub_choice == '5':
-                        manager.auto_split_windows = not manager.auto_split_windows
-                        feedback_message = f"{SUCCESS} Auto-Split windows toggled {color_state(manager.auto_split_windows)}."
-                    elif sub_choice == '6':
-                        confirm = input(f"{WARN} Toggling this feature will shut down Chrome. Proceed? (y/N): ")
-                        if confirm.lower() == 'y':
-                            manager.kill_chrome()
-                            manager.open_incognito = not manager.open_incognito
-                            manager.build_cmd_base()
-                            feedback_message = f"{SUCCESS} Incognito Mode toggled {color_state(manager.open_incognito)}."
-                        else:
-                            feedback_message = f"{SUCCESS} Incognito Mode will remain {color_state(manager.open_incognito)}"
-                    elif sub_choice == '7':
-                        confirm = input(f"{WARN} Toggling this feature will shut down Chrome. Proceed? (y/N): ")
-                        if confirm.lower() == 'y':
-                            manager.kill_chrome()
-                            manager.disable_gpu = not manager.disable_gpu
-                            manager.build_cmd_base()
-                            feedback_message = f"{SUCCESS} Hardware Acceleration toggled {color_state(manager.disable_gpu)}"
-                        else:
-                            feedback_message = f"{SUCCESS} Hardware Acceleration will remain {color_state(manager.disable_gpu)}"
-                    elif sub_choice == '8':
-                        manager.randomize_urls = not manager.randomize_urls
-                        feedback_message = f"{SUCCESS} Cache busting toggled {color_state(manager.randomize_urls)}."
-                    elif sub_choice == '9':
-                        print(f"\n{INFO} Chrome may become unstable with too many tabs per window. This sets the limit before splitting. (Default: {DEFAULT_MAX_TABS})")
-                        manager.max_tabs_per_window = get_valid_input("Max tabs before splitting (5 - 5000)", manager.max_tabs_per_window, 5, 5000)
-                        feedback_message = f"{SUCCESS} Tab limit updated to {manager.max_tabs_per_window}."
-                    elif sub_choice == '10':
-                        print(f"\n{INFO} The pause duration between batch tab injections to allow the OS scheduler to catch up. (Default: {DEFAULT_COOLDOWN})")
-                        manager.cooldown = get_valid_input("Cooldown between chunks (0.0s - 60.0s)", manager.cooldown, 0.0, 60.0, True)
-                        feedback_message = f"{SUCCESS} Cooldown updated to {manager.cooldown}s."
-                    elif sub_choice == '11':
-                        print(f"\n{INFO} Tabs to open simultaneously. High values may choke CPUs due to IPC overhead. (Default: {DEFAULT_CHUNK_SIZE})")
-                        manager.chunk_size = get_valid_input("New chunk size (1 - 1000 tabs)", manager.chunk_size, 1, 1000)
-                        feedback_message = f"{SUCCESS} Chunk size updated to {manager.chunk_size}."
-                    elif sub_choice == '12':
-                        print(f"\n{INFO} Failsafe to prevent the OS from hard-crashing by halting injection if free memory dips too low. (Default: {DEFAULT_RAM_THRESHOLD} MB)")
-                        manager.min_ram_threshold = get_valid_input("Minimum RAM to trigger Safety Threshold (100 - 5000 MB)", manager.min_ram_threshold, 100, 5000)
-                        feedback_message = f"{SUCCESS} RAM threshold updated to {manager.min_ram_threshold} MB."
-                    elif sub_choice == '13':
-                        confirm = input(f"{WARN} Adjusting this feature will shut down Chrome. Proceed? (y/N): ")
-                        if confirm.lower() == 'y':
-                            manager.kill_chrome()
-                            print(
-                                f"{INDENT}{INFO} Caps Chrome's allowed renderer processes relative to your total logical cores. (Default: {DEFAULT_THREAD_ALLOCATION}%)")
-                            manager.thread_allocation = get_valid_input("Thread Allocation percentage (1 - 100%)", manager.thread_allocation, 1, 100)
-                            manager.build_cmd_base()
-                            feedback_message = f"{SUCCESS} Chrome will allocate {manager.thread_allocation}% of Logical CPU Cores ({manager.allocated_renderers} threads)."
-                        else:
-                            feedback_message = f"{SUCCESS} Thread allocation will remain at {manager.thread_allocation}% ({manager.allocated_renderers} threads)."
-                    elif sub_choice == '14':
-                        print(f"\n{INFO} Mid-blast CSV logging. 1 = End-sample only. Higher numbers = More data points, but may introduce stuttering. (Default: {DEFAULT_LOG_GRANULARITY})")
-                        manager.log_granularity = get_valid_input("Logging Granularity (1-5)", manager.log_granularity, 1, 5)
-                        feedback_message = f"{SUCCESS} Logging Granularity updated to {manager.log_granularity} interval(s)."
-                    elif sub_choice == '15':
-                        feedback_message = manager.load_presets()
-                    elif sub_choice == '16':
-                        feedback_message = manager.reset_to_defaults()
-                    elif sub_choice == '0':
-                        break
-                    else:
-                        feedback_message = f"{WARN} Invalid choice."
+                handle_settings_menu(manager)
 
             elif choice == '0':
                 print("\nExiting script.")
