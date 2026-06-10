@@ -11,5 +11,7 @@ https://twitter.com/
 https://www.reddit.com/
 https://maps.google.com/
 https://pinterest.com/
-https://www.shadertoy.com/
 https://LTTstore.com/
+
+### Add Easter Eggs Below ###
+# Format: tab_count: https://url.com

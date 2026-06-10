@@ -7,7 +7,7 @@ Developed specifically for Linus Tech Tips (LTT) hardware stress-testing.
 
 Author: Michael Maldonado @MichaelJohniel
 License: MIT
-Version: 1.2.8
+Version: 1.3.0
 Created: 2026-03-20
 Updated: 2026-06-09
 """
@@ -41,6 +41,9 @@ DEFAULT_PRESETS = [
     "https://pinterest.com/",  # Infinite image grids
     "https://LTTstore.com/", # It's how you use a stubby that matters
 ]
+
+# Easter Egg
+DEFAULT_MILESTONE_URLS = {1000:"https://global.lttstore.com/"}
 
 BASE_DIR = Path(__file__).parent.resolve()
 CUSTOM_URLS_FILE = BASE_DIR / "custom_urls.txt"
@@ -113,8 +116,7 @@ def animated_loading(duration):
         filled = int(bar_length * percent)
         bar = '█' * filled + '-' * (bar_length - filled)
 
-        # \r overwrites the line. flush=True forces the terminal to push the frame instantly
-        print(f'\r    -> Giving tabs a moment to render: [{bar}] {int(percent * 100)}%', end='', flush=True)
+        print(f'\r{INDENT}-> Giving tabs a moment to render: [{bar}] {int(percent * 100)}%', end='', flush=True)
         time.sleep(0.1)
 
     print()
@@ -309,6 +311,8 @@ class ChromeManager:
         self.cooldown = DEFAULT_COOLDOWN
         self.randomize_urls = DEFAULT_URL_RANDOMIZATION
         self.peak_chrome_ram = 0
+        self.milestone_urls = {}
+        self.triggered_milestones = set()
 
         # Load URLs
         self.active_urls = []
@@ -378,6 +382,8 @@ class ChromeManager:
 
     def load_presets(self):
         """Parses custom_urls.txt for custom URLs. Uses 'DEFAULT_PRESETS' otherwise."""
+        self.milestone_urls = dict(DEFAULT_MILESTONE_URLS)
+
         if CUSTOM_URLS_FILE.exists():
             try:
                 with open(CUSTOM_URLS_FILE, 'r', encoding='utf-8') as f:
@@ -385,6 +391,18 @@ class ChromeManager:
                     for line in f:
                         line_cleaned = line.strip()
                         if line_cleaned and not line_cleaned.startswith("#"):
+
+                            # Parse milestones easter egg
+                            if ":" in line_cleaned and line_cleaned.split(":", 1)[0].strip().isdigit():
+                                parts = line_cleaned.split(":", 1)
+                                milestone_num = int(parts[0].strip())
+                                milestone_url = parts[1].strip().strip('",\'')
+
+                                if validate_url(milestone_url):
+                                    self.milestone_urls[milestone_num] = milestone_url
+                                continue
+
+                            # Parse standard URLs
                             if validate_url(line_cleaned):
                                 urls.append(line_cleaned)
                             else:
@@ -412,6 +430,8 @@ class ChromeManager:
                 f.write("# Below is the default preset:\n\n")
                 for url in DEFAULT_PRESETS:
                     f.write(f"{url}\n")
+                f.write("\n### Add Easter Eggs Below ###\n")
+                f.write("# Format: tab_count: https://url.com\n")
             return f"{NOTE} Generated example '{CUSTOM_URLS_FILE}' and loaded default presets."
         except Exception as e:
             return f"{NOTE} Loaded default preset. (Could not generate example file: {e})"
@@ -436,6 +456,19 @@ class ChromeManager:
         else:
             tab_queue = random.choices(self.active_urls, k=num_tabs)
 
+        # Calculate injection range
+        initial_total_tabs = sum(len(win["urls"]) for win in self.windows)
+        end_total_tabs = initial_total_tabs + num_tabs
+
+        # Milestone injections
+        pending_milestones = {}
+        for milestone, m_url in sorted(self.milestone_urls.items()):
+            # Verify an injection milestone is in range
+            if initial_total_tabs < milestone <= end_total_tabs and milestone not in self.triggered_milestones:
+                queue_index = milestone - initial_total_tabs - 1
+                tab_queue[queue_index] = m_url
+                pending_milestones[queue_index] = milestone
+
         action_text = "blast" if force_new_window else "inject"
         print(f"\n{NOTE} Preparing to {action_text} {num_tabs} tabs. This may take a moment...")
 
@@ -447,54 +480,67 @@ class ChromeManager:
         milestones = [round(i / self.log_granularity, 2) for i in range(1, self.log_granularity)]
         next_milestone_idx = 0
 
-        while tab_queue:
-            if not self._is_safe_to_open():
-                print(f"\n{WARN} Stopping {action_text}. {tabs_opened} tabs were opened.")
-                if tabs_opened > 0:
-                    self.log_csv_checkpoint(tabs_opened / num_tabs)
-                break
+        try:
+            while tab_queue:
+                if not self._is_safe_to_open():
+                    print(f"\n{WARN} Stopping {action_text}. {tabs_opened} tabs were opened.")
+                    if tabs_opened > 0:
+                        self.log_csv_checkpoint(tabs_opened / num_tabs)
+                    break
 
-            # Calculate space left in the active window
-            if is_first_chunk:
-                space_left = self.max_tabs_per_window if self.auto_split_windows else float('inf')
-            elif self.auto_split_windows and self.windows:
-                space_left = self.max_tabs_per_window - len(self.windows[-1]["urls"])
-                if space_left <= 0:
-                    space_left = self.max_tabs_per_window
-            else:
-                space_left = len(tab_queue)
+                # Calculate space left in the active window
+                if is_first_chunk:
+                    space_left = self.max_tabs_per_window if self.auto_split_windows else float('inf')
+                elif self.auto_split_windows and self.windows:
+                    space_left = self.max_tabs_per_window - len(self.windows[-1]["urls"])
+                    if space_left <= 0:
+                        space_left = self.max_tabs_per_window
+                else:
+                    space_left = len(tab_queue)
 
-            # Prioritize the smallest: user's chunk size, space left in a window, or remaining tabs
-            take_count = min(self.chunk_size, space_left, len(tab_queue))
-            chunk = tab_queue[:take_count]
-            tab_queue = tab_queue[take_count:]
+                # Prioritize the smallest: user's chunk size, space left in a window, or remaining tabs
+                take_count = min(self.chunk_size, space_left, len(tab_queue))
+                chunk = tab_queue[:take_count]
+                tab_queue = tab_queue[take_count:]
 
-            # Force a new window for the first chunk, or if the current window is full
-            needs_new_window = is_first_chunk or (self.auto_split_windows and (
-                        not self.windows or len(self.windows[-1]["urls"]) >= self.max_tabs_per_window))
+                # Force a new window for the first chunk, or if the current window is full
+                needs_new_window = is_first_chunk or (self.auto_split_windows and (
+                            not self.windows or len(self.windows[-1]["urls"]) >= self.max_tabs_per_window))
 
-            if needs_new_window:
-                self._run_cmd(["--new-window"] + chunk)
-                self.windows.append({"urls": chunk})
-            else:
-                self._run_cmd(chunk)
-                self.windows[-1]["urls"].extend(chunk)
+                if needs_new_window:
+                    self._run_cmd(["--new-window"] + chunk)
+                    self.windows.append({"urls": chunk})
+                else:
+                    self._run_cmd(chunk)
+                    self.windows[-1]["urls"].extend(chunk)
 
-            is_first_chunk = False
-            time.sleep(self.cooldown)
-            tabs_opened += len(chunk)
+                is_first_chunk = False
+                time.sleep(self.cooldown)
+                tabs_opened += len(chunk)
 
-            # CSV milestone logging
-            current_progress = tabs_opened / num_tabs
-            while next_milestone_idx < len(milestones) and current_progress >= milestones[next_milestone_idx]:
-                self.log_csv_checkpoint(milestones[next_milestone_idx])
-                next_milestone_idx += 1
+                # CSV milestone logging
+                current_progress = tabs_opened / num_tabs
+                while next_milestone_idx < len(milestones) and current_progress >= milestones[next_milestone_idx]:
+                    self.log_csv_checkpoint(milestones[next_milestone_idx])
+                    next_milestone_idx += 1
 
-            if self.show_metrics:
-                print(f"\r    -> Opened: [ {tabs_opened} / {num_tabs} ]...", end="", flush=True)
+                if self.show_metrics:
+                    print(f"\r{INDENT}-> Opened: [ {tabs_opened} / {num_tabs} ]...", end="", flush=True)
+        except KeyboardInterrupt:
+            print(f"\n{WARN} Tab injection aborted by user! Saving partial data...")
+            if tabs_opened > 0:
+                print(f"{INDENT}-> Skipping render wait due to manual interrupt.")
+        else:
+            if tabs_opened > 0:
+                self.wait_for_render(tabs_opened)
+        finally:
+            # Track milestones
+            for queue_index, milestone in pending_milestones.items():
+                if queue_index < tabs_opened:
+                    self.triggered_milestones.add(milestone)
 
+        # Report metrics
         if tabs_opened > 0:
-            self.wait_for_render(tabs_opened)
             action_type = "New" if force_new_window else "add"
             self.print_metrics(original_chrome_ram, tabs_opened, action_type)
         else:
@@ -517,6 +563,7 @@ class ChromeManager:
         self.windows = []
         self.blasts = []
         self.peak_chrome_ram = 0
+        self.triggered_milestones = set()
         print(f"{INDENT}{SUCCESS} Consider Chrome dead.\n")
 
     def log_csv_checkpoint(self, progress_pct):
@@ -536,7 +583,7 @@ class ChromeManager:
 
         file_exists = self.csv_file.is_file()
         try:
-            with open(self.csv_file, 'a') as f:
+            with open(self.csv_file, 'a', encoding='utf-8') as f:
                 if not file_exists:
                     f.write("Timestamp,Total_Blasts,Blast_Phase,Total_Tabs,Chrome_RAM_MB,Available_RAM_MB,CPU_Usage_Pct\n")
 
