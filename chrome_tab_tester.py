@@ -348,7 +348,22 @@ class ChromeManager:
         elif sys.platform.startswith('linux'):
             chrome_names = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']
             linux_chrome_path = next((name for name in chrome_names if shutil.which(name)), 'google-chrome')
-            self.cmd_base = [linux_chrome_path]
+
+            linux_chrome_path = next((name for name in chrome_names if shutil.which(name)), None)
+
+            # Check for Flatpak Chrome if native versions not found
+            if not linux_chrome_path and shutil.which('flatpak'):
+                try:
+                    subprocess.run(['flatpak', 'info', 'com.google.Chrome'], capture_output=True, check=True)
+                    linux_chrome_path = 'flatpak run com.google.Chrome'
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    pass
+
+            if not linux_chrome_path:
+                raise RuntimeError(
+                    "Chrome/Chromium not found. Please install google-chrome, chromium, or enable Flatpak.")
+
+            self.cmd_base = linux_chrome_path.split() if ' ' in linux_chrome_path else [linux_chrome_path]
             self.current_os = Platform.LINUX
         elif sys.platform.startswith('darwin'):
             mac_chrome_path = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
